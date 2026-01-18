@@ -29,6 +29,7 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
         val_dataset_group: Optional[train_util.DatasetGroup],
     ):
+        self.validate_mdm_args(args)
         sdxl_train_util.verify_sdxl_training_args(args)
 
         if args.cache_text_encoder_outputs:
@@ -190,14 +191,18 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         batch,
         weight_dtype,
         indices: Optional[List[int]] = None,
+        size_embeddings=None,
     ):
         noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
 
         # get size embeddings
-        orig_size = batch["original_sizes_hw"]
-        crop_size = batch["crop_top_lefts"]
-        target_size = batch["target_sizes_hw"]
-        embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
+        if size_embeddings is None:
+            orig_size = batch["original_sizes_hw"]
+            crop_size = batch["crop_top_lefts"]
+            target_size = batch["target_sizes_hw"]
+            embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
+        else:
+            embs = size_embeddings
 
         # concat embeddings
         encoder_hidden_states1, encoder_hidden_states2, pool2 = text_conds
@@ -212,6 +217,23 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
 
         noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
         return noise_pred
+
+    def _scale_size_tensor(self, size_tensor, scale: float, device, min_value: int, step: int):
+        if not torch.is_tensor(size_tensor):
+            size_tensor = torch.tensor(size_tensor, device=device)
+        size_tensor = size_tensor.to(device=device, dtype=torch.float32)
+        scaled = torch.round(size_tensor * scale)
+        if step > 1:
+            scaled = torch.round(scaled / step) * step
+        return torch.clamp(scaled, min=min_value).to(dtype=torch.int64)
+
+    def get_size_embeddings_override(self, args, batch, scale: float, device, weight_dtype):
+        if not args.mdm_scales or scale == 1.0:
+            return None
+        orig_size = self._scale_size_tensor(batch["original_sizes_hw"], scale, device, min_value=32, step=32)
+        crop_size = self._scale_size_tensor(batch["crop_top_lefts"], scale, device, min_value=0, step=1)
+        target_size = self._scale_size_tensor(batch["target_sizes_hw"], scale, device, min_value=32, step=32)
+        return sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, device).to(weight_dtype)
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         sdxl_train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)

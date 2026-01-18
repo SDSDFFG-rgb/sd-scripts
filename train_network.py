@@ -57,6 +57,91 @@ class NetworkTrainer:
     def __init__(self):
         self.vae_scale_factor = 0.18215
         self.is_sdxl = False
+        self.global_step = 0
+        self._mdm_config = None
+
+    def _parse_mdm_csv(self, value, value_type=float):
+        if value is None:
+            return None
+        if isinstance(value, list):
+            if len(value) == 0:
+                return None
+            if len(value) == 1 and isinstance(value[0], str):
+                value = value[0]
+            else:
+                return [value_type(v) for v in value]
+        if isinstance(value, str):
+            value = value.strip()
+            if value == "":
+                return None
+            return [value_type(v.strip()) for v in value.split(",") if v.strip() != ""]
+        return [value_type(value)]
+
+    def _get_mdm_config(self, args: argparse.Namespace):
+        if self._mdm_config is not None:
+            return self._mdm_config
+
+        scales = self._parse_mdm_csv(args.mdm_scales, float)
+        if not scales:
+            self._mdm_config = None
+            return None
+
+        weights = self._parse_mdm_csv(args.mdm_weights, float)
+        steps = self._parse_mdm_csv(args.mdm_progressive_steps, int)
+
+        if weights is not None and len(weights) != len(scales):
+            raise ValueError("mdm_weights must have the same length as mdm_scales")
+        if steps is not None and len(steps) != len(scales):
+            raise ValueError("mdm_progressive_steps must have the same length as mdm_scales")
+
+        if weights is None:
+            weights = [1.0] * len(scales)
+
+        self._mdm_config = {
+            "scales": scales,
+            "weights": weights,
+            "steps": steps,
+        }
+        return self._mdm_config
+
+    def _get_active_mdm_scales(self, args: argparse.Namespace):
+        config = self._get_mdm_config(args)
+        if config is None:
+            return None, None
+
+        scales = config["scales"]
+        weights = config["weights"]
+        steps = config["steps"]
+
+        if steps is None:
+            active_scales = scales
+            active_weights = weights
+        else:
+            active_scales = [s for s, step in zip(scales, steps) if self.global_step >= step]
+            active_weights = [w for w, step in zip(weights, steps) if self.global_step >= step]
+            if not active_scales:
+                active_scales = [scales[0]]
+                active_weights = [weights[0]]
+
+        if not args.mdm_no_normalize_weights:
+            total = sum(active_weights)
+            if total > 0:
+                active_weights = [w / total for w in active_weights]
+
+        return active_scales, active_weights
+
+    def _scale_latents(self, latents: torch.FloatTensor, scale: float) -> torch.FloatTensor:
+        if scale == 1.0:
+            return latents
+        h, w = latents.shape[-2:]
+        new_h = max(1, int(round(h * scale)))
+        new_w = max(1, int(round(w * scale)))
+        if new_h == h and new_w == w:
+            return latents
+        return torch.nn.functional.interpolate(latents, size=(new_h, new_w), mode="bilinear", align_corners=False)
+
+    def get_size_embeddings_override(self, args, batch, scale: float, device, weight_dtype):
+        return None
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -172,9 +257,23 @@ class NetworkTrainer:
         train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
         val_dataset_group: Optional[train_util.DatasetGroup],
     ):
+        self.validate_mdm_args(args)
         train_dataset_group.verify_bucket_reso_steps(64)
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(64)
+
+    def validate_mdm_args(self, args: argparse.Namespace):
+        scales = self._parse_mdm_csv(args.mdm_scales, float)
+        if not scales:
+            return
+        if any(s <= 0 for s in scales):
+            raise ValueError("mdm_scales must be positive")
+        weights = self._parse_mdm_csv(args.mdm_weights, float)
+        if weights is not None and len(weights) != len(scales):
+            raise ValueError("mdm_weights must have the same length as mdm_scales")
+        steps = self._parse_mdm_csv(args.mdm_progressive_steps, int)
+        if steps is not None and len(steps) != len(scales):
+            raise ValueError("mdm_progressive_steps must have the same length as mdm_scales")
 
     def load_target_model(self, args, weight_dtype, accelerator) -> tuple[str, nn.Module, nn.Module, Optional[nn.Module]]:
         text_encoder, vae, unet, _ = train_util.load_target_model(args, weight_dtype, accelerator)
@@ -225,7 +324,19 @@ class NetworkTrainer:
         for t_enc in text_encoders:
             t_enc.to(accelerator.device, dtype=weight_dtype)
 
-    def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype, **kwargs):
+    def call_unet(
+        self,
+        args,
+        accelerator,
+        unet,
+        noisy_latents,
+        timesteps,
+        text_conds,
+        batch,
+        weight_dtype,
+        size_embeddings=None,
+        **kwargs,
+    ):
         noise_pred = unet(noisy_latents, timesteps, text_conds[0]).sample
         return noise_pred
 
@@ -270,6 +381,7 @@ class NetworkTrainer:
         weight_dtype,
         train_unet,
         is_train=True,
+        mdm_scale: float = 1.0,
     ):
         # Sample noise, sample a random timestep for each image, and add noise to the latents,
         # with noise offset and/or multires noise if specified
@@ -283,6 +395,7 @@ class NetworkTrainer:
                 t.requires_grad_(True)
 
         # Predict the noise residual
+        size_embeddings = self.get_size_embeddings_override(args, batch, mdm_scale, accelerator.device, weight_dtype)
         with torch.set_grad_enabled(is_train), accelerator.autocast():
             noise_pred = self.call_unet(
                 args,
@@ -293,6 +406,7 @@ class NetworkTrainer:
                 text_encoder_conds,
                 batch,
                 weight_dtype,
+                size_embeddings=size_embeddings,
             )
 
         if args.v_parameterization:
@@ -321,11 +435,64 @@ class NetworkTrainer:
                         batch,
                         weight_dtype,
                         indices=diff_output_pr_indices,
+                        size_embeddings=size_embeddings,
                     )
                 network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
                 target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
 
         return noise_pred, target, timesteps, None
+
+    def compute_mdm_loss(
+        self,
+        args,
+        accelerator,
+        noise_scheduler,
+        latents,
+        batch,
+        text_encoder_conds,
+        unet,
+        network,
+        weight_dtype,
+        train_unet,
+        is_train=True,
+    ) -> torch.Tensor:
+        scales, weights = self._get_active_mdm_scales(args)
+        if scales is None:
+            raise ValueError("mdm_scales is not set")
+
+        total_loss = 0.0
+        for scale, weight in zip(scales, weights):
+            scaled_latents = self._scale_latents(latents, scale)
+            noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
+                args,
+                accelerator,
+                noise_scheduler,
+                scaled_latents,
+                batch,
+                text_encoder_conds,
+                unet,
+                network,
+                weight_dtype,
+                train_unet,
+                is_train=is_train,
+                mdm_scale=scale,
+            )
+
+            huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
+            loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+            if weighting is not None:
+                loss = loss * weighting
+            if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                loss = apply_masked_loss(loss, batch)
+            loss = loss.mean([1, 2, 3])
+
+            loss_weights = batch["loss_weights"]
+            loss = loss * loss_weights
+            loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
+
+            total_loss = total_loss + loss.mean() * weight
+
+        return total_loss
 
     def post_process_loss(self, loss, args, timesteps: torch.IntTensor, noise_scheduler) -> torch.FloatTensor:
         if args.min_snr_gamma:
@@ -448,6 +615,21 @@ class NetworkTrainer:
                 for i in range(len(encoded_text_encoder_conds)):
                     if encoded_text_encoder_conds[i] is not None:
                         text_encoder_conds[i] = encoded_text_encoder_conds[i]
+
+        if args.mdm_scales:
+            return self.compute_mdm_loss(
+                args,
+                accelerator,
+                noise_scheduler,
+                latents,
+                batch,
+                text_encoder_conds,
+                unet,
+                network,
+                weight_dtype,
+                train_unet,
+                is_train=is_train,
+            )
 
         # sample noise, call unet, get target
         noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
@@ -1424,6 +1606,7 @@ class NetworkTrainer:
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
+                    self.global_step = global_step
                     loss = self.process_batch(
                         batch,
                         text_encoders,
@@ -1555,6 +1738,7 @@ class NetworkTrainer:
 
                             args.min_timestep = args.max_timestep = timestep  # dirty hack to change timestep
 
+                            self.global_step = global_step
                             loss = self.process_batch(
                                 batch,
                                 text_encoders,
@@ -1633,6 +1817,7 @@ class NetworkTrainer:
                         # temporary, for batch processing
                         self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=False)
 
+                        self.global_step = global_step
                         loss = self.process_batch(
                             batch,
                             text_encoders,
@@ -1898,6 +2083,30 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Max number of validation dataset items processed. By default, validation will run the entire validation dataset / 処理される検証データセット項目の最大数。デフォルトでは、検証は検証データセット全体を実行します",
+    )
+
+    parser.add_argument(
+        "--mdm_scales",
+        type=str,
+        default=None,
+        help="comma-separated scales for MDM-lite multi-resolution training, e.g. 1.0,0.75,0.5 / MDM風の多解像度学習のスケール",
+    )
+    parser.add_argument(
+        "--mdm_weights",
+        type=str,
+        default=None,
+        help="comma-separated weights for mdm_scales, must match length / mdm_scalesの重み",
+    )
+    parser.add_argument(
+        "--mdm_progressive_steps",
+        type=str,
+        default=None,
+        help="comma-separated step thresholds per scale, scale is active when global_step>=threshold / スケールごとの開始ステップ",
+    )
+    parser.add_argument(
+        "--mdm_no_normalize_weights",
+        action="store_true",
+        help="do not normalize mdm_weights / mdm_weightsを正規化しない",
     )
     return parser
 
