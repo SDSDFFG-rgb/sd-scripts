@@ -2,6 +2,7 @@ import torch
 import torch.optim
 import math
 from typing import Callable
+from muon import muon_update
 
 class HyperFusionScheduleFree(torch.optim.Optimizer):
     r"""
@@ -22,6 +23,11 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                  use_radam_rectify: bool = True,   # Default True for stability
                  use_adopt_denominator: bool = True, # Default True for ADOPT behavior
                  cautious: bool = True,            # Default True for Cautious behavior
+                 # --- Muon Options ---
+                 use_muon: bool = False,
+                 muon_momentum: float = 0.95,
+                 muon_ns_steps: int = 5,
+                 muon_nesterov: bool = True,
                  ):
 
         if not lr >= 0.0:
@@ -41,6 +47,10 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                         use_radam_rectify=use_radam_rectify,
                         use_adopt_denominator=use_adopt_denominator,
                         cautious=cautious,
+                        use_muon=use_muon,
+                        muon_momentum=muon_momentum,
+                        muon_ns_steps=muon_ns_steps,
+                        muon_nesterov=muon_nesterov,
                         )
         super().__init__(params, defaults)
 
@@ -187,7 +197,22 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                 denom = torch._foreach_sqrt(exp_avg_sqs)
                 torch._foreach_add_(denom, eps)
 
-            grads_for_update = torch._foreach_div(grads_original, denom)
+            grads_for_update = list(torch._foreach_div(grads_original, denom))
+
+            if group['use_muon']:
+                for i, p in enumerate(params_with_grad):
+                    if p.ndim < 2:
+                        continue
+                    state = self.state[p]
+                    if 'muon_momentum_buffer' not in state:
+                        state['muon_momentum_buffer'] = torch.zeros_like(p.data)
+                    muon_vec = muon_update(grads_original[i], state['muon_momentum_buffer'],
+                                           beta=group['muon_momentum'],
+                                           ns_steps=group['muon_ns_steps'],
+                                           nesterov=group['muon_nesterov'])
+                    if muon_vec.shape != p.data.shape:
+                        muon_vec = muon_vec.reshape(p.data.shape)
+                    grads_for_update[i] = muon_vec
 
             # Weight Decay (Standard L2)
             if group['weight_decay'] != 0:
