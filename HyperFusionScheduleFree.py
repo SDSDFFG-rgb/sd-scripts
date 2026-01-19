@@ -1,7 +1,7 @@
 import torch
 import torch.optim
 import math
-from typing import Callable
+from typing import Callable, Optional
 from muon import muon_update
 
 class HyperFusionScheduleFree(torch.optim.Optimizer):
@@ -21,7 +21,9 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                  weight_lr_power: float = 2.0,
                  # --- Stability Options ---
                  use_radam_rectify: bool = True,   # Default True for stability
-                 use_adopt_denominator: bool = True, # Default True for ADOPT behavior
+                 use_adopt_prev_v: bool = True,     # Default True for ADOPT behavior
+                 use_adopt_denominator: Optional[bool] = None,  # Backward compatibility
+                 use_adopt_order_swap: bool = False,  # ADOPT update order
                  cautious: bool = True,            # Default True for Cautious behavior
                  # --- Muon Options ---
                  use_muon: bool = False,
@@ -32,6 +34,9 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
 
         if not lr >= 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
+
+        if use_adopt_denominator is not None:
+            use_adopt_prev_v = use_adopt_denominator
 
         defaults = dict(lr=lr,
                         betas=betas,
@@ -45,7 +50,8 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                         weight_lr_power=weight_lr_power,
                         weight_decay=weight_decay,
                         use_radam_rectify=use_radam_rectify,
-                        use_adopt_denominator=use_adopt_denominator,
+                        use_adopt_prev_v=use_adopt_prev_v,
+                        use_adopt_order_swap=use_adopt_order_swap,
                         cautious=cautious,
                         use_muon=use_muon,
                         muon_momentum=muon_momentum,
@@ -182,11 +188,10 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                 continue
 
             # --- Calculation Phase ---
-            torch._foreach_mul_(exp_avgs, beta1)
-            torch._foreach_add_(exp_avgs, grads_original, alpha=1 - beta1)
+            use_adopt_prev_v = group['use_adopt_prev_v']
+            use_adopt_order_swap = group['use_adopt_order_swap']
 
-            # ADOPT Logic
-            if group['use_adopt_denominator'] and k > 0:
+            if use_adopt_prev_v and k > 0:
                 # Use previous step's second moment for denominator
                 denom = torch._foreach_sqrt(exp_avg_sqs)
                 torch._foreach_add_(denom, eps)
@@ -197,7 +202,16 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                 denom = torch._foreach_sqrt(exp_avg_sqs)
                 torch._foreach_add_(denom, eps)
 
-            grads_for_update = list(torch._foreach_div(grads_original, denom))
+            grads_norm = list(torch._foreach_div(grads_original, denom))
+
+            if use_adopt_order_swap:
+                torch._foreach_mul_(exp_avgs, beta1)
+                torch._foreach_add_(exp_avgs, grads_norm, alpha=1 - beta1)
+                grads_for_update = exp_avgs
+            else:
+                torch._foreach_mul_(exp_avgs, beta1)
+                torch._foreach_add_(exp_avgs, grads_original, alpha=1 - beta1)
+                grads_for_update = grads_norm
 
             if group['use_muon']:
                 for i, p in enumerate(params_with_grad):
@@ -247,7 +261,7 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
             torch._foreach_sub_(zs, grads_for_update, alpha=effective_lr)
 
             # ADOPT: Update second moment AFTER parameter update
-            if group['use_adopt_denominator']:
+            if group['use_adopt_prev_v']:
                 torch._foreach_mul_(exp_avg_sqs, beta2)
                 torch._foreach_addcmul_(exp_avg_sqs, grads_original, grads_original, value=1 - beta2)
 
