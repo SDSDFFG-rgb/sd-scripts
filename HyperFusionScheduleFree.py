@@ -25,6 +25,7 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                  use_adopt_denominator: Optional[bool] = None,  # Backward compatibility
                  use_adopt_order_swap: bool = False,  # ADOPT update order
                  cautious: bool = True,            # Default True for Cautious behavior
+                 cautious_scale_by_mask_mean: bool = False,  # Optional mask mean rescale
                  # --- Muon Options ---
                  use_muon: bool = False,
                  muon_momentum: float = 0.95,
@@ -53,6 +54,7 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                         use_adopt_prev_v=use_adopt_prev_v,
                         use_adopt_order_swap=use_adopt_order_swap,
                         cautious=cautious,
+                        cautious_scale_by_mask_mean=cautious_scale_by_mask_mean,
                         use_muon=use_muon,
                         muon_momentum=muon_momentum,
                         muon_ns_steps=muon_ns_steps,
@@ -245,6 +247,11 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                     
                     # Cautious Mask: Only update where u and grad_orig have same sign
                     mask = (u * grad_orig > 0).to(grad_orig.dtype)
+
+                    if group['cautious_scale_by_mask_mean']:
+                        mask_mean = mask.mean()
+                        if mask_mean.item() > 0:
+                            u = u / mask_mean
                     
                     # Apply update: y = y - u * mask
                     y.sub_(u.mul(mask))
