@@ -134,8 +134,14 @@ class NetworkTrainer:
         if scale == 1.0:
             return latents
         h, w = latents.shape[-2:]
-        new_h = max(1, int(round(h * scale)))
-        new_w = max(1, int(round(w * scale)))
+        new_h = int(round(h * scale))
+        new_w = int(round(w * scale))
+
+        def round_to_multiple(v, m):
+            return max(m, int(round(v / m)) * m)
+
+        new_h = round_to_multiple(new_h, 8)
+        new_w = round_to_multiple(new_w, 8)
         if new_h == h and new_w == w:
             return latents
         return torch.nn.functional.interpolate(latents, size=(new_h, new_w), mode="bilinear", align_corners=False)
