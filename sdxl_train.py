@@ -623,6 +623,13 @@ def train(args):
         accelerator.log({}, step=0)
 
     loss_recorder = train_util.LossRecorder()
+    use_optimizer_closure = args.optimizer_use_closure
+    if use_optimizer_closure and (args.fused_backward_pass or args.fused_optimizer_groups):
+        logger.warning("optimizer_use_closure is disabled with fused optimizer options")
+        use_optimizer_closure = False
+    if use_optimizer_closure and args.gradient_accumulation_steps > 1:
+        logger.warning("optimizer_use_closure is disabled when gradient_accumulation_steps > 1")
+        use_optimizer_closure = False
     for epoch in range(num_train_epochs):
         accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
         current_epoch.value = epoch + 1
@@ -637,124 +644,153 @@ def train(args):
                 optimizer_hooked_count = {i: 0 for i in range(len(optimizers))}  # reset counter for each step
 
             with accelerator.accumulate(*training_models):
-                if "latents" in batch and batch["latents"] is not None:
-                    latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
-                else:
-                    with torch.no_grad():
-                        # latentに変換
-                        latents = vae.encode(batch["images"].to(vae_dtype)).latent_dist.sample().to(weight_dtype)
+                def compute_loss():
+                    if "latents" in batch and batch["latents"] is not None:
+                        latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
+                    else:
+                        with torch.no_grad():
+                            # latentに変換
+                            latents = vae.encode(batch["images"].to(vae_dtype)).latent_dist.sample().to(weight_dtype)
 
-                        # NaNが含まれていれば警告を表示し0に置き換える
-                        if torch.any(torch.isnan(latents)):
-                            accelerator.print("NaN found in latents, replacing with zeros")
-                            latents = torch.nan_to_num(latents, 0, out=latents)
-                latents = latents * sdxl_model_util.VAE_SCALE_FACTOR
+                            # NaNが含まれていれば警告を表示し0に置き換える
+                            if torch.any(torch.isnan(latents)):
+                                accelerator.print("NaN found in latents, replacing with zeros")
+                                latents = torch.nan_to_num(latents, 0, out=latents)
+                    latents = latents * sdxl_model_util.VAE_SCALE_FACTOR
 
-                text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
-                if text_encoder_outputs_list is not None:
-                    # Text Encoder outputs are cached
-                    encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoder_outputs_list
-                    encoder_hidden_states1 = encoder_hidden_states1.to(accelerator.device, dtype=weight_dtype)
-                    encoder_hidden_states2 = encoder_hidden_states2.to(accelerator.device, dtype=weight_dtype)
-                    pool2 = pool2.to(accelerator.device, dtype=weight_dtype)
-                else:
-                    input_ids1, input_ids2 = batch["input_ids_list"]
-                    with torch.set_grad_enabled(args.train_text_encoder):
-                        # Get the text embedding for conditioning
-                        if args.weighted_captions:
-                            input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
-                            encoder_hidden_states1, encoder_hidden_states2, pool2 = (
-                                text_encoding_strategy.encode_tokens_with_weights(
+                    text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
+                    if text_encoder_outputs_list is not None:
+                        # Text Encoder outputs are cached
+                        encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoder_outputs_list
+                        encoder_hidden_states1 = encoder_hidden_states1.to(accelerator.device, dtype=weight_dtype)
+                        encoder_hidden_states2 = encoder_hidden_states2.to(accelerator.device, dtype=weight_dtype)
+                        pool2 = pool2.to(accelerator.device, dtype=weight_dtype)
+                    else:
+                        input_ids1, input_ids2 = batch["input_ids_list"]
+                        with torch.set_grad_enabled(args.train_text_encoder):
+                            # Get the text embedding for conditioning
+                            if args.weighted_captions:
+                                input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                                encoder_hidden_states1, encoder_hidden_states2, pool2 = (
+                                    text_encoding_strategy.encode_tokens_with_weights(
+                                        tokenize_strategy,
+                                        [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
+                                        input_ids_list,
+                                        weights_list,
+                                    )
+                                )
+                            else:
+                                input_ids1 = input_ids1.to(accelerator.device)
+                                input_ids2 = input_ids2.to(accelerator.device)
+                                encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens(
                                     tokenize_strategy,
                                     [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
-                                    input_ids_list,
-                                    weights_list,
+                                    [input_ids1, input_ids2],
                                 )
-                            )
-                        else:
-                            input_ids1 = input_ids1.to(accelerator.device)
-                            input_ids2 = input_ids2.to(accelerator.device)
-                            encoder_hidden_states1, encoder_hidden_states2, pool2 = text_encoding_strategy.encode_tokens(
-                                tokenize_strategy,
-                                [text_encoder1, text_encoder2, accelerator.unwrap_model(text_encoder2)],
-                                [input_ids1, input_ids2],
-                            )
-                        if args.full_fp16:
-                            encoder_hidden_states1 = encoder_hidden_states1.to(weight_dtype)
-                            encoder_hidden_states2 = encoder_hidden_states2.to(weight_dtype)
-                            pool2 = pool2.to(weight_dtype)
+                            if args.full_fp16:
+                                encoder_hidden_states1 = encoder_hidden_states1.to(weight_dtype)
+                                encoder_hidden_states2 = encoder_hidden_states2.to(weight_dtype)
+                                pool2 = pool2.to(weight_dtype)
 
-                # get size embeddings
-                orig_size = batch["original_sizes_hw"]
-                crop_size = batch["crop_top_lefts"]
-                target_size = batch["target_sizes_hw"]
-                embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
+                    # get size embeddings
+                    orig_size = batch["original_sizes_hw"]
+                    crop_size = batch["crop_top_lefts"]
+                    target_size = batch["target_sizes_hw"]
+                    embs = sdxl_train_util.get_size_embeddings(orig_size, crop_size, target_size, accelerator.device).to(weight_dtype)
 
-                # concat embeddings
-                vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
-                text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
+                    # concat embeddings
+                    vector_embedding = torch.cat([pool2, embs], dim=1).to(weight_dtype)
+                    text_embedding = torch.cat([encoder_hidden_states1, encoder_hidden_states2], dim=2).to(weight_dtype)
 
-                # Sample noise, sample a random timestep for each image, and add noise to the latents,
-                # with noise offset and/or multires noise if specified
-                noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
+                    # Sample noise, sample a random timestep for each image, and add noise to the latents,
+                    # with noise offset and/or multires noise if specified
+                    noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
 
-                noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
+                    noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
 
-                # Predict the noise residual
-                with accelerator.autocast():
-                    noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
+                    # Predict the noise residual
+                    with accelerator.autocast():
+                        noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
 
-                if args.v_parameterization:
-                    # v-parameterization training
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    target = noise
+                    if args.v_parameterization:
+                        # v-parameterization training
+                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        target = noise
 
-                huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
-                if (
-                    args.min_snr_gamma
-                    or args.scale_v_pred_loss_like_noise_pred
-                    or args.v_pred_like_loss
-                    or args.debiased_estimation_loss
-                    or args.masked_loss
-                ):
-                    # do not mean over batch dimension for snr weight or scale v-pred loss
-                    loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
-                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-                        loss = apply_masked_loss(loss, batch)
-                    loss = loss.mean([1, 2, 3])
+                    huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
+                    if (
+                        args.min_snr_gamma
+                        or args.scale_v_pred_loss_like_noise_pred
+                        or args.v_pred_like_loss
+                        or args.debiased_estimation_loss
+                        or args.masked_loss
+                    ):
+                        # do not mean over batch dimension for snr weight or scale v-pred loss
+                        loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
+                        if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                            loss = apply_masked_loss(loss, batch)
+                        loss = loss.mean([1, 2, 3])
 
-                    if args.min_snr_gamma:
-                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
-                    if args.scale_v_pred_loss_like_noise_pred:
-                        loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
-                    if args.v_pred_like_loss:
-                        loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
-                    if args.debiased_estimation_loss:
-                        loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
+                        if args.min_snr_gamma:
+                            loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.v_parameterization)
+                        if args.scale_v_pred_loss_like_noise_pred:
+                            loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
+                        if args.v_pred_like_loss:
+                            loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
+                        if args.debiased_estimation_loss:
+                            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
 
-                    loss = loss.mean()  # mean over batch dimension
-                else:
-                    loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "mean", huber_c)
+                        loss = loss.mean()  # mean over batch dimension
+                    else:
+                        loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "mean", huber_c)
 
-                accelerator.backward(loss)
+                    return loss
 
-                if not (args.fused_backward_pass or args.fused_optimizer_groups):
-                    if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                        params_to_clip = []
-                        for m in training_models:
-                            params_to_clip.extend(m.parameters())
-                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                if use_optimizer_closure:
+                    loss_container = {"value": None}
 
-                    optimizer.step()
+                    def closure():
+                        optimizer.zero_grad(set_to_none=True)
+                        loss = compute_loss()
+                        accelerator.backward(loss)
+
+                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                            params_to_clip = []
+                            for m in training_models:
+                                params_to_clip.extend(m.parameters())
+                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                        loss_container["value"] = loss
+                        return loss
+
+                    loss = optimizer.step(closure)
+                    if loss is None or not isinstance(loss, torch.Tensor):
+                        loss = loss_container["value"]
+                    if loss is None:
+                        raise RuntimeError("optimizer_use_closure requires optimizer.step to call closure")
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                 else:
-                    # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
-                    lr_scheduler.step()
-                    if args.fused_optimizer_groups:
-                        for i in range(1, len(optimizers)):
-                            lr_schedulers[i].step()
+                    loss = compute_loss()
+                    accelerator.backward(loss)
+
+                    if not (args.fused_backward_pass or args.fused_optimizer_groups):
+                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                            params_to_clip = []
+                            for m in training_models:
+                                params_to_clip.extend(m.parameters())
+                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
+                    else:
+                        # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
+                        lr_scheduler.step()
+                        if args.fused_optimizer_groups:
+                            for i in range(1, len(optimizers)):
+                                lr_schedulers[i].step()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:

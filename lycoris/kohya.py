@@ -691,6 +691,66 @@ class LycorisNetworkKohya(LycorisNetwork):
 
         return all_params
 
+    def prepare_optimizer_params_with_multiple_te_lrs(self, text_encoder_lrs, unet_lr, learning_rate):
+        def enumerate_params(loras):
+            params = []
+            for lora in loras:
+                params.extend(lora.parameters())
+            return params
+
+        def resolve_te_lr(index, te_lrs):
+            if te_lrs is None:
+                return None
+            if isinstance(te_lrs, (list, tuple)):
+                if len(te_lrs) == 0:
+                    return None
+                if index <= len(te_lrs):
+                    return te_lrs[index - 1]
+                return te_lrs[0]
+            return te_lrs
+
+        self.requires_grad_(True)
+        all_params = []
+
+        if self.text_encoder_loras:
+            te_groups = {}
+            for lora in self.text_encoder_loras:
+                name = lora.lora_name
+                prefix = LycorisNetworkKohya.LORA_PREFIX_TEXT_ENCODER
+                if name.startswith(prefix):
+                    rest = name[len(prefix) :]
+                    idx_str = ""
+                    for ch in rest:
+                        if ch.isdigit():
+                            idx_str += ch
+                        else:
+                            break
+                    if idx_str:
+                        te_idx = int(idx_str)
+                    else:
+                        te_idx = 1
+                else:
+                    te_idx = 1
+                te_groups.setdefault(te_idx, []).append(lora)
+
+            for te_idx in sorted(te_groups.keys()):
+                params = enumerate_params(te_groups[te_idx])
+                if not params:
+                    continue
+                param_data = {"params": params}
+                te_lr = resolve_te_lr(te_idx, text_encoder_lrs)
+                if te_lr is not None:
+                    param_data["lr"] = te_lr
+                all_params.append(param_data)
+
+        if self.unet_loras:
+            param_data = {"params": enumerate_params(self.unet_loras)}
+            if unet_lr is not None:
+                param_data["lr"] = unet_lr
+            all_params.append(param_data)
+
+        return all_params
+
     def save_weights(self, file, dtype, metadata):
         if metadata is not None and len(metadata) == 0:
             metadata = None

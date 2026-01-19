@@ -3708,6 +3708,11 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
         nargs="*",
         help='additional arguments for optimizer (like "weight_decay=0.01 betas=0.9,0.999 ...") / オプティマイザの追加引数（例： "weight_decay=0.01 betas=0.9,0.999 ..."）',
     )
+    parser.add_argument(
+        "--optimizer_use_closure",
+        action="store_true",
+        help="use optimizer.step(closure) with loss/backward in closure when supported / optimizer.step(closure) を使う",
+    )
 
     # parser.add_argument(
     #     "--optimizer_schedulefree_wrapper",
