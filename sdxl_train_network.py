@@ -30,6 +30,14 @@ class SdxlNetworkTrainer(train_network.NetworkTrainer):
         val_dataset_group: Optional[train_util.DatasetGroup],
     ):
         self.validate_mdm_args(args)
+        if getattr(args, "ti_token_strings", None) and args.cache_text_encoder_outputs:
+            raise AssertionError(
+                "cache_text_encoder_outputs is not supported when training textual inversion embeddings"
+                " / 埋め込みを学習する場合はcache_text_encoder_outputsは使用できません"
+            )
+        if getattr(args, "ti_train_frac", None) is not None:
+            if args.ti_train_frac < 0.0 or args.ti_train_frac > 1.0:
+                raise AssertionError("ti_train_frac must be in [0.0, 1.0]")
         sdxl_train_util.verify_sdxl_training_args(args)
 
         if args.cache_text_encoder_outputs:

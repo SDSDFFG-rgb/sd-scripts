@@ -77,6 +77,58 @@ class NetworkTrainer:
             return [value_type(v.strip()) for v in value.split(",") if v.strip() != ""]
         return [value_type(value)]
 
+    def _parse_ti_token_strings(self, value) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            if len(value) == 0:
+                return []
+            if len(value) == 1 and isinstance(value[0], str):
+                value = value[0]
+            else:
+                tokens = [str(v).strip() for v in value]
+                return [t for t in tokens if t]
+        if isinstance(value, str):
+            tokens = [t.strip() for t in value.split(",")]
+            return [t for t in tokens if t]
+        return [str(value).strip()]
+
+    def _parse_ti_init_words(self, value, token_count: int) -> list[Optional[str]]:
+        if value is None:
+            return [None] * token_count
+        if isinstance(value, list):
+            words = [str(v).strip() for v in value if str(v).strip()]
+        else:
+            words = [w.strip() for w in str(value).split(",") if w.strip()]
+        if len(words) == 1 and token_count > 1:
+            return words * token_count
+        if len(words) != token_count:
+            raise ValueError("ti_init_words must match ti_token_strings length or be a single value.")
+        return words
+
+    def _parse_ti_replace_tokens(self, value, token_count: int) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            tokens = [str(v).strip() for v in value if str(v).strip()]
+        else:
+            tokens = [t.strip() for t in str(value).split(",") if t.strip()]
+        if len(tokens) == 1 and token_count > 1:
+            return tokens * token_count
+        if len(tokens) != token_count:
+            raise ValueError("ti_replace_tokens must match ti_token_strings length or be a single value.")
+        return tokens
+
+    def _split_replace_tokens(self, value: str) -> list[str]:
+        return [v.strip() for v in value.split("|") if v.strip()]
+
+    def _build_ti_token_variants(self, base_token: str, num_vectors: int) -> list[str]:
+        if num_vectors <= 0:
+            raise ValueError("ti_num_vectors_per_token must be > 0")
+        if num_vectors == 1:
+            return [base_token]
+        return [base_token] + [f"{base_token}{i+1}" for i in range(num_vectors - 1)]
+
     def _get_mdm_config(self, args: argparse.Namespace):
         if self._mdm_config is not None:
             return self._mdm_config
@@ -264,6 +316,14 @@ class NetworkTrainer:
         val_dataset_group: Optional[train_util.DatasetGroup],
     ):
         self.validate_mdm_args(args)
+        if getattr(args, "ti_token_strings", None) and args.cache_text_encoder_outputs:
+            raise AssertionError(
+                "cache_text_encoder_outputs is not supported when training textual inversion embeddings"
+                " / 埋め込みを学習する場合はcache_text_encoder_outputsは使用できません"
+            )
+        if getattr(args, "ti_train_frac", None) is not None:
+            if args.ti_train_frac < 0.0 or args.ti_train_frac > 1.0:
+                raise AssertionError("ti_train_frac must be in [0.0, 1.0]")
         train_dataset_group.verify_bucket_reso_steps(64)
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(64)
@@ -695,6 +755,14 @@ class NetworkTrainer:
         tokenize_strategy = self.get_tokenize_strategy(args)
         strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
         tokenizers = self.get_tokenizers(tokenize_strategy)  # will be removed after sample_image is refactored
+        ti_base_tokens = self._parse_ti_token_strings(getattr(args, "ti_token_strings", None))
+        ti_num_vectors_per_token = getattr(args, "ti_num_vectors_per_token", 1)
+        ti_replace_tokens = self._parse_ti_replace_tokens(
+            getattr(args, "ti_replace_tokens", None), len(ti_base_tokens)
+        ) if ti_base_tokens else []
+        ti_token_data = []
+        ti_min_token_id_list = []
+        ti_embedding_params = []
 
         # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
         latents_caching_strategy = self.get_latents_caching_strategy(args)
@@ -747,6 +815,16 @@ class NetworkTrainer:
             train_dataset_group = train_util.load_arbitrary_dataset(args)
             val_dataset_group = None  # placeholder until validation dataset supported for arbitrary
 
+        if ti_base_tokens and ti_replace_tokens:
+            for base_token, replace_from in zip(ti_base_tokens, ti_replace_tokens):
+                token_variants = self._build_ti_token_variants(base_token, ti_num_vectors_per_token)
+                replace_to = " ".join(token_variants)
+                for replace_from_part in self._split_replace_tokens(replace_from):
+                    train_dataset_group.add_replacement(replace_from_part, replace_to)
+                if val_dataset_group is not None:
+                    for replace_from_part in self._split_replace_tokens(replace_from):
+                        val_dataset_group.add_replacement(replace_from_part, replace_to)
+
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
@@ -794,6 +872,58 @@ class NetworkTrainer:
 
         # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
+
+        # setup textual inversion embeddings (optional)
+        ti_init_words = self._parse_ti_init_words(getattr(args, "ti_init_words", None), len(ti_base_tokens)) if ti_base_tokens else []
+        if ti_base_tokens:
+            unique_tokens = set()
+            for base_token in ti_base_tokens:
+                variants = self._build_ti_token_variants(base_token, ti_num_vectors_per_token)
+                for token in variants:
+                    if token in unique_tokens:
+                        raise ValueError(f"duplicate ti token string: {token}")
+                    unique_tokens.add(token)
+
+            for tokenizer in tokenizers:
+                new_tokens = [t for base in ti_base_tokens for t in self._build_ti_token_variants(base, ti_num_vectors_per_token)]
+                num_added = tokenizer.add_tokens(new_tokens)
+                if num_added != len(new_tokens):
+                    raise ValueError(
+                        "one or more ti_token_strings already exist in tokenizer, please choose different strings"
+                    )
+
+            for t_enc, tokenizer in zip(text_encoders, tokenizers):
+                t_enc.resize_token_embeddings(len(tokenizer))
+
+            for base_token, init_word in zip(ti_base_tokens, ti_init_words):
+                token_variants = self._build_ti_token_variants(base_token, ti_num_vectors_per_token)
+                token_ids_by_encoder = []
+                for t_enc, tokenizer in zip(text_encoders, tokenizers):
+                    token_ids = tokenizer.convert_tokens_to_ids(token_variants)
+                    token_ids_by_encoder.append(token_ids)
+                    if init_word is not None:
+                        init_token_ids = tokenizer.encode(init_word, add_special_tokens=False)
+                        if len(init_token_ids) > 1 and len(init_token_ids) != ti_num_vectors_per_token:
+                            logger.warning(
+                                f"init_word token length does not match num_vectors_per_token; will repeat or truncate: {init_word}"
+                            )
+                        token_embeds = t_enc.get_input_embeddings().weight.data
+                        with torch.no_grad():
+                            for i, token_id in enumerate(token_ids):
+                                token_embeds[token_id] = token_embeds[init_token_ids[i % len(init_token_ids)]]
+                ti_token_data.append(
+                    {
+                        "name": base_token,
+                        "token_variants": token_variants,
+                        "token_ids_by_encoder": token_ids_by_encoder,
+                    }
+                )
+
+            for tokenizer_index, tokenizer in enumerate(tokenizers):
+                all_ids = []
+                for token_info in ti_token_data:
+                    all_ids.extend(token_info["token_ids_by_encoder"][tokenizer_index])
+                ti_min_token_id_list.append(min(all_ids))
 
         # prepare dataset for latents caching if needed
         if cache_latents:
@@ -941,6 +1071,16 @@ class NetworkTrainer:
         except TypeError as e:
             trainable_params = network.prepare_optimizer_params(text_encoder_lr, args.unet_lr)
             lr_descriptions = None
+
+        if ti_embedding_params:
+            ti_lr = args.ti_lr if args.ti_lr is not None else args.learning_rate
+            if not isinstance(trainable_params, list):
+                trainable_params = list(trainable_params)
+            for i, emb_param in enumerate(ti_embedding_params):
+                trainable_params.append({"params": [emb_param], "lr": ti_lr})
+                if lr_descriptions is not None:
+                    label = f"ti_emb_te{i+1}" if len(ti_embedding_params) > 1 else "ti_emb"
+                    lr_descriptions.append(label)
 
         # if len(trainable_params) == 0:
         #     accelerator.print("no trainable parameters found / 学習可能なパラメータが見つかりませんでした")
@@ -1114,6 +1254,17 @@ class NetworkTrainer:
         if args.full_fp16:
             train_util.patch_accelerator_for_fp16_training(accelerator)
 
+        ti_index_no_updates_list = []
+        ti_orig_embeds_params_list = []
+        if ti_token_data:
+            for tokenizer, text_encoder, min_token_id in zip(tokenizers, text_encoders, ti_min_token_id_list):
+                index_no_updates = torch.arange(len(tokenizer)) < min_token_id
+                ti_index_no_updates_list.append(index_no_updates)
+                orig_embeds_params = text_encoder.get_input_embeddings().weight.data.detach().clone()
+                ti_orig_embeds_params_list.append(orig_embeds_params)
+                text_encoder.text_model.embeddings.token_embedding.requires_grad_(True)
+                ti_embedding_params.append(text_encoder.get_input_embeddings().weight)
+
         # before resuming make hook for saving/loading to save/load the network weights only
         def save_model_hook(models, weights, output_dir):
             # pop weights of other models than network to save only network weights
@@ -1251,6 +1402,14 @@ class NetworkTrainer:
             "ss_validate_every_n_steps": args.validate_every_n_steps,
             "ss_resize_interpolation": args.resize_interpolation,
         }
+        if ti_token_data:
+            metadata["ss_ti_token_strings"] = ",".join(ti_base_tokens)
+            metadata["ss_ti_num_vectors_per_token"] = ti_num_vectors_per_token
+            metadata["ss_ti_lr"] = args.ti_lr if args.ti_lr is not None else args.learning_rate
+            metadata["ss_ti_train_frac"] = args.ti_train_frac
+            metadata["ss_ti_bundle_embeddings"] = bool(args.ti_bundle_embeddings)
+            if ti_replace_tokens:
+                metadata["ss_ti_replace_tokens"] = ",".join(ti_replace_tokens)
 
         self.update_metadata(metadata, args)  # architecture specific metadata
 
@@ -1495,6 +1654,46 @@ class NetworkTrainer:
             metadata_to_save.update(sai_metadata)
 
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+            if args.ti_bundle_embeddings and ti_token_data:
+                embed_state = {}
+                is_sdxl = len(text_encoders) == 2
+                for token_info in ti_token_data:
+                    name = token_info["name"]
+                    for enc_index, token_ids in enumerate(token_info["token_ids_by_encoder"]):
+                        t_enc = accelerator.unwrap_model(text_encoders[enc_index])
+                        emb = t_enc.get_input_embeddings().weight[token_ids].data.detach().clone().to("cpu")
+                        if save_dtype is not None:
+                            emb = emb.to(save_dtype)
+                        if is_sdxl:
+                            key_name = "clip_l" if enc_index == 0 else "clip_g"
+                        else:
+                            key_name = "emb_params"
+                        embed_state[f"bundle_emb.{name}.{key_name}"] = emb
+
+                if embed_state:
+                    file_ext = os.path.splitext(ckpt_file)[1].lower()
+                    if file_ext == ".safetensors":
+                        from safetensors import safe_open
+                        from safetensors.torch import save_file
+
+                        state_dict = {}
+                        with safe_open(ckpt_file, framework="pt", device="cpu") as f:
+                            for key in f.keys():
+                                state_dict[key] = f.get_tensor(key).clone()
+                        state_dict.update(embed_state)
+                        metadata_for_bundle = dict(metadata_to_save) if metadata_to_save is not None else {}
+                        model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(state_dict, metadata_for_bundle)
+                        metadata_for_bundle["sshs_model_hash"] = model_hash
+                        metadata_for_bundle["sshs_legacy_hash"] = legacy_hash
+                        tmp_ckpt_file = ckpt_file + ".tmp"
+                        save_file(state_dict, tmp_ckpt_file, metadata_for_bundle)
+                        os.replace(tmp_ckpt_file, ckpt_file)
+                    elif file_ext == ".pt":
+                        state_dict = torch.load(ckpt_file, map_location="cpu")
+                        if isinstance(state_dict, dict):
+                            state_dict.update(embed_state)
+                            torch.save(state_dict, ckpt_file)
+
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
@@ -1545,6 +1744,10 @@ class NetworkTrainer:
         progress_bar = tqdm(
             range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
         )
+        ti_stop_step = None
+        if ti_token_data and args.ti_train_frac is not None:
+            ti_stop_step = int(args.max_train_steps * args.ti_train_frac)
+        ti_frozen = False
 
         validation_steps = (
             min(args.max_validation_steps, len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
@@ -1606,6 +1809,23 @@ class NetworkTrainer:
                     initial_step -= 1
                     continue
 
+                ti_active = False
+                if ti_token_data:
+                    if ti_stop_step is None:
+                        ti_active = True
+                    else:
+                        ti_active = global_step < ti_stop_step
+
+                train_text_encoder_for_step = train_text_encoder or ti_active
+
+                if ti_token_data and not ti_active and not ti_frozen:
+                    for group in optimizer.param_groups:
+                        if any(param is p for p in ti_embedding_params for param in group["params"]):
+                            group["lr"] = 0.0
+                    for t_enc in text_encoders:
+                        t_enc.get_input_embeddings().weight.requires_grad_(False)
+                    ti_frozen = True
+
                 with accelerator.accumulate(training_model):
                     on_step_start_for_network(text_encoder, unet)
 
@@ -1627,7 +1847,7 @@ class NetworkTrainer:
                         text_encoding_strategy,
                         tokenize_strategy,
                         is_train=True,
-                        train_text_encoder=train_text_encoder,
+                        train_text_encoder=train_text_encoder_for_step,
                         train_unet=train_unet,
                     )
 
@@ -1635,7 +1855,10 @@ class NetworkTrainer:
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                            params_to_clip = list(accelerator.unwrap_model(network).get_trainable_params())
+                            if ti_active and ti_token_data:
+                                for t_enc in text_encoders:
+                                    params_to_clip.extend(t_enc.get_input_embeddings().parameters())
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                         if hasattr(network, "update_grad_norms"):
@@ -1646,6 +1869,16 @@ class NetworkTrainer:
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+
+                    if ti_active and ti_token_data:
+                        with torch.no_grad():
+                            for text_encoder, orig_embeds_params, index_no_updates in zip(
+                                text_encoders, ti_orig_embeds_params_list, ti_index_no_updates_list
+                            ):
+                                input_embeddings_weight = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight
+                                input_embeddings_weight[index_no_updates] = orig_embeds_params.to(input_embeddings_weight.dtype)[
+                                    index_no_updates
+                                ]
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -2113,6 +2346,47 @@ def setup_parser() -> argparse.ArgumentParser:
         "--mdm_no_normalize_weights",
         action="store_true",
         help="do not normalize mdm_weights / mdm_weightsを正規化しない",
+    )
+    parser.add_argument(
+        "--ti_token_strings",
+        type=str,
+        default=None,
+        help="comma-separated new token strings for textual inversion (optional) / 埋め込み用の新規トークン（カンマ区切り）",
+    )
+    parser.add_argument(
+        "--ti_num_vectors_per_token",
+        type=int,
+        default=1,
+        help="number of vectors per token for textual inversion / 埋め込みのベクトル数",
+    )
+    parser.add_argument(
+        "--ti_init_words",
+        type=str,
+        default=None,
+        help="comma-separated init words for each ti token (optional) / 各埋め込みの初期化単語（カンマ区切り）",
+    )
+    parser.add_argument(
+        "--ti_replace_tokens",
+        type=str,
+        default=None,
+        help="comma-separated caption tokens to replace with ti tokens; use | to map multiple sources to one target (optional) / 置換対象トークン（カンマ区切り、複数元は|）",
+    )
+    parser.add_argument(
+        "--ti_lr",
+        type=float,
+        default=None,
+        help="learning rate for textual inversion embeddings (default: learning_rate) / 埋め込み学習率",
+    )
+    parser.add_argument(
+        "--ti_train_frac",
+        type=float,
+        default=None,
+        help="fraction of total steps to train embeddings (0.0-1.0). None trains for all steps / 埋め込み学習を行う割合",
+    )
+    parser.add_argument(
+        "--ti_bundle_embeddings",
+        action="store_true",
+        help="bundle trained embeddings into LoRA safetensors (bundle_emb.* keys) / 埋め込みをLoRAに同梱する",
     )
     return parser
 
