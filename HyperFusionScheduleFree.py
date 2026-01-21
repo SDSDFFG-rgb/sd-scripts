@@ -1,8 +1,10 @@
+# NOTE: Minimal-fix variant.
 import torch
 import torch.optim
 import math
 from typing import Callable, Optional
 from muon import muon_update
+
 
 class HyperFusionScheduleFree(torch.optim.Optimizer):
     r"""
@@ -122,6 +124,8 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                     if p.grad is None: continue
                     grad = p.grad.data
                     if not torch.isfinite(grad).all(): continue
+                    if group['weight_decay'] != 0:
+                        grad = grad.add(p.data, alpha=group['weight_decay'])
 
                     state = self.state[p]
                     if 'exp_avg' not in state:
@@ -134,6 +138,13 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                     
                     # Standard Adam second moment
                     exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1-beta2)
+
+                    # Apply momentum-SGD style update during warmup (RAdam-style)
+                    bias_correction1 = 1 - beta1 ** (k + 1)
+                    if bias_correction1 <= 0: bias_correction1 = 1e-8
+                    step_size = group['lr'] / bias_correction1
+                    p.data.add_(exp_avg, alpha=-step_size)
+                    state['z'].copy_(p.data)
 
                 group['k'] += 1
                 continue
@@ -255,6 +266,8 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
                     
                     # Apply update: y = y - u * mask
                     y.sub_(u.mul(mask))
+                    # Keep z consistent with cautious masking
+                    z.sub_(grad_norm.mul(mask), alpha=effective_lr)
             else:
                 # Fully Foreach Path (Faster, Standard ScheduleFree)
                 y_list = [p.data for p in params_with_grad]
@@ -265,7 +278,8 @@ class HyperFusionScheduleFree(torch.optim.Optimizer):
 
             # --- Finalize ---
             # Update Z (Slow Weights): z = z - effective_lr * grad_norm
-            torch._foreach_sub_(zs, grads_for_update, alpha=effective_lr)
+            if not group['cautious']:
+                torch._foreach_sub_(zs, grads_for_update, alpha=effective_lr)
 
             # ADOPT: Update second moment AFTER parameter update
             if group['use_adopt_prev_v']:
