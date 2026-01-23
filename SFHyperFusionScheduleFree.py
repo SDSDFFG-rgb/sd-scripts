@@ -218,10 +218,11 @@ class SFHyperFusionScheduleFree(torch.optim.Optimizer):
                     u = (y - z).mul(ckp1).add(grad_norm, alpha=adaptive_y_lr)
                     
                     # Cautious Mask: Only update where u and grad_orig have same sign
+                    # Use normalized gradient for mask to reduce noise sensitivity.
                     if group['cautious_soft_mask']:
-                        mask = torch.sigmoid((u * grad_orig) * group['cautious_soft_k']).to(grad_orig.dtype)
+                        mask = torch.sigmoid((u * grad_norm) * group['cautious_soft_k']).to(grad_orig.dtype)
                     else:
-                        mask = (u * grad_orig > 0).to(grad_orig.dtype)
+                        mask = (u * grad_norm > 0).to(grad_orig.dtype)
                     
                     # Apply update: y = y - u * mask
                     y.sub_(u.mul(mask))
