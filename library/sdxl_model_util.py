@@ -1,4 +1,5 @@
 import torch
+import safetensors
 from accelerate import init_empty_weights
 from accelerate.utils.modeling import set_module_tensor_to_device
 from safetensors.torch import load_file, save_file
@@ -7,9 +8,11 @@ from typing import List
 from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
 from library import model_util
 from library import sdxl_original_unet
-from .utils import setup_logging
+from library.utils import setup_logging
+
 setup_logging()
 import logging
+
 logger = logging.getLogger(__name__)
 
 VAE_SCALE_FACTOR = 0.13025
@@ -163,17 +166,20 @@ def _load_state_dict_on_device(model, state_dict, device, dtype=None):
     raise RuntimeError("Error(s) in loading state_dict for {}:\n\t{}".format(model.__class__.__name__, "\n\t".join(error_msgs)))
 
 
-def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dtype=None):
+def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dtype=None, disable_mmap=False):
     # model_version is reserved for future use
     # dtype is used for full_fp16/bf16 integration. Text Encoder will remain fp32, because it runs on CPU when caching
 
     # Load the state dict
     if model_util.is_safetensors(ckpt_path):
         checkpoint = None
-        try:
-            state_dict = load_file(ckpt_path, device=map_location)
-        except:
-            state_dict = load_file(ckpt_path)  # prevent device invalid Error
+        if disable_mmap:
+            state_dict = safetensors.torch.load(open(ckpt_path, "rb").read())
+        else:
+            try:
+                state_dict = load_file(ckpt_path, device=map_location)
+            except:
+                state_dict = load_file(ckpt_path)  # prevent device invalid Error
         epoch = None
         global_step = None
     else:
@@ -190,14 +196,17 @@ def load_models_from_sdxl_checkpoint(model_version, ckpt_path, map_location, dty
 
     # U-Net
     logger.info("building U-Net")
-    with init_empty_weights():
-        unet = sdxl_original_unet.SdxlUNet2DConditionModel()
-
-    logger.info("loading U-Net from checkpoint")
     unet_sd = {}
     for k in list(state_dict.keys()):
         if k.startswith("model.diffusion_model."):
             unet_sd[k.replace("model.diffusion_model.", "")] = state_dict.pop(k)
+
+    # Inpainting checkpoints have input_blocks.0.0.weight with 9 in_channels instead of 4.
+    actual_in_channels = unet_sd["input_blocks.0.0.weight"].shape[1]
+    with init_empty_weights():
+        unet = sdxl_original_unet.SdxlUNet2DConditionModel(in_channels=actual_in_channels)
+
+    logger.info("loading U-Net from checkpoint")
     info = _load_state_dict_on_device(unet, unet_sd, device=map_location, dtype=dtype)
     logger.info(f"U-Net: {info}")
 
